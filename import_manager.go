@@ -25,6 +25,11 @@ type importWorkerChannels struct {
 	status  chan<- ImportStatusUpdate
 }
 
+type recordOrError struct {
+	record Record
+	err    error
+}
+
 func (rim recordImportManager) run(field *Field, iterator RecordIterator, options ImportOptions) error {
 	shardWidth := field.index.shardWidth
 	threadCount := uint64(options.threadCount)
@@ -52,23 +57,52 @@ func (rim recordImportManager) run(field *Field, iterator RecordIterator, option
 	var importErr error
 	done := uint64(0)
 
+	inputChan := make(chan recordOrError)
 	go func(it RecordIterator) {
-		var record Record
-		var err error
 		for {
-			record, err = it.NextRecord()
+			rec, err := it.NextRecord()
+			inputChan <- recordOrError{record: rec, err: err}
 			if err != nil {
-				if err == io.EOF {
-					err = nil
-				}
 				break
 			}
-			shard := record.Shard(shardWidth)
-			idx := shard % threadCount
-			recordBufs[idx] = append(recordBufs[idx], record)
-			if len(recordBufs[idx]) == cap(recordBufs[idx]) {
-				recordChans[idx] <- recordBufs[idx]
-				recordBufs[idx] = make([]Record, 0, 16)
+		}
+		close(inputChan)
+	}(iterator)
+
+	go func() {
+		var record Record
+		var err error
+		ticker := time.NewTicker(options.timeout)
+	receiveRecords:
+		for {
+			select {
+			case recerr, ok := <-inputChan:
+				if !ok {
+					break receiveRecords
+				}
+				err = recerr.err
+				if err != nil {
+					if err == io.EOF {
+						err = nil
+					}
+					break receiveRecords
+				}
+				record = recerr.record
+				shard := record.Shard(shardWidth)
+				idx := shard % threadCount
+				recordBufs[idx] = append(recordBufs[idx], record)
+				if len(recordBufs[idx]) == cap(recordBufs[idx]) {
+					recordChans[idx] <- recordBufs[idx]
+					recordBufs[idx] = make([]Record, 0, 16)
+				}
+			case <-ticker.C:
+				// flush all non-empty buffers every tick
+				for idx, buf := range recordBufs {
+					if len(buf) > 0 {
+						recordChans[idx] <- buf
+						recordBufs[idx] = make([]Record, 0, 16)
+					}
+				}
 			}
 		}
 		// send any trailing data
@@ -79,7 +113,7 @@ func (rim recordImportManager) run(field *Field, iterator RecordIterator, option
 			}
 		}
 		recordErrChan <- err
-	}(iterator)
+	}()
 
 sendRecords:
 	for done < threadCount {
@@ -126,31 +160,48 @@ func recordImportWorker(id int, client *Client, field *Field, chans importWorker
 	batchSize := options.batchSize
 	shardWidth := field.index.shardWidth
 
-readRecords:
-	for recordBatch := range recordChan {
-		// It's fine to overrun our allowed batch size slightly, and
-		// we don't want to generate separate batches for part of a
-		// 16-item batch.
-		for _, record := range recordBatch {
-			recordCount++
-			shard := record.Shard(shardWidth)
-			if batchForShard[shard] == nil {
-				batchForShard[shard] = make([]Record, 0, batchSize)
+	flush := func(batchForShard map[uint64][]Record) (err error) {
+		for shard, records := range batchForShard {
+			if len(records) == 0 {
+				continue
 			}
-			batchForShard[shard] = append(batchForShard[shard], record)
+			err = importRecords(id, client, field, shardNodes, shard, records, options, statusChan, state)
+			if err != nil {
+				return
+			}
+			delete(batchForShard, shard)
 		}
-		if recordCount >= batchSize {
-			for shard, records := range batchForShard {
-				if len(records) == 0 {
-					continue
+		recordCount = 0
+		return
+	}
+	ticker := time.NewTicker(options.timeout)
+readRecords:
+	for {
+		select {
+		case recordBatch, ok := <-recordChan:
+			if !ok {
+				break readRecords
+			}
+			// It's fine to overrun our allowed batch size slightly, and
+			// we don't want to generate separate batches for part of a
+			// 16-item batch.
+			for _, record := range recordBatch {
+				recordCount++
+				shard := record.Shard(shardWidth)
+				if batchForShard[shard] == nil {
+					batchForShard[shard] = make([]Record, 0, batchSize)
 				}
-				err = importRecords(id, client, field, shardNodes, shard, records, options, statusChan, state)
-				if err != nil {
+				batchForShard[shard] = append(batchForShard[shard], record)
+			}
+			if recordCount >= batchSize {
+				if err := flush(batchForShard); err != nil {
 					break readRecords
 				}
-				delete(batchForShard, shard)
 			}
-			recordCount = 0
+		case <-ticker.C:
+			if err := flush(batchForShard); err != nil {
+				break readRecords
+			}
 		}
 	}
 

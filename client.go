@@ -1842,6 +1842,14 @@ func OptImportSort(sorting bool) ImportOption {
 	}
 }
 
+// OptImportTimeout sets the maximum time to wait before flushing a batch of data to Pilosa.
+func OptImportTimeout(timeout time.Duration) ImportOption {
+	return func(options *ImportOptions) error {
+		options.timeout = timeout
+		return nil
+	}
+}
+
 func importRecordsFunction(fun func(field *Field,
 	shard uint64,
 	records []Record,
